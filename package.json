@@ -1,7 +1,7 @@
 {
 	"name": "@perasite/pi-retry",
-	"version": "0.31.0",
-	"description": "Public pi extension that retries empty-detail, Codex websocket-limit, and stalled provider errors.",
+	"version": "0.32.0",
+	"description": "Pi provider-error retry hints and non-destructive stream stall warnings.",
 	"type": "module",
 	"license": "MIT",
 	"private": false,
@@ -22,13 +22,17 @@
 		]
 	},
 	"scripts": {
-		"check": "biome check . && npm run typecheck",
-		"format": "biome check --write .",
-		"typecheck": "tsc --noEmit"
+		"check": "biome check --line-width 100 src test package.json && npm run typecheck && npm test",
+		"format": "biome check --write --line-width 100 src test package.json",
+		"typecheck": "tsc --noEmit --strict --skipLibCheck --target ES2023 --module NodeNext src/*.ts",
+		"test": "node --test test/*.test.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.99.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.5",
-		"@earendil-works/pi-coding-agent": "0.82.1",
+		"@earendil-works/pi-coding-agent": "0.99.2",
 		"typescript": "7.0.2"
 	},
 	"repository": {

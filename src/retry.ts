@@ -15,7 +15,6 @@ const RETRYABLE_HINT = "provider returned error";
 const UNKNOWN_ERROR_TAG = "[unknown-error-retry]";
 const CODEX_WEBSOCKET_CONNECTION_LIMIT_TAG = "[codex-websocket-limit-retry]";
 const CODEX_GENERIC_RETRY_TAG = "[codex-generic-retry]";
-const STALL_WATCHDOG_TAG = "[stall-watchdog-retry]";
 const STATUS_KEY = "retry";
 const STATUS_VISIBLE_MS = 8_000;
 const INCOMING_STATUS_VISIBLE_MS = 1_500;
@@ -27,7 +26,7 @@ type StatusContext = Pick<ExtensionContext, "hasUI" | "ui">;
 
 type RetryPolicyContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted">;
 
-type WatchdogContext = StatusContext & Pick<ExtensionContext, "abort" | "isIdle">;
+type WatchdogContext = StatusContext & Pick<ExtensionContext, "isIdle">;
 
 export type RetryPolicy = {
 	enabled: boolean | undefined;
@@ -38,14 +37,7 @@ export type RetryOptions = {
 	readRetryPolicy?: (ctx: RetryPolicyContext) => RetryPolicy;
 };
 
-type MessageShape = {
-	role?: string;
-	stopReason?: string;
-	errorMessage?: unknown;
-	[key: string]: unknown;
-};
-
-type StatusMode = "incoming" | "retry";
+type StatusMode = "incoming" | "retry" | "stalled";
 
 export function parseStallTimeoutMs(value: unknown): number | undefined {
 	if (value === undefined || value === null || value === "") return undefined;
@@ -74,7 +66,7 @@ export function readPiRetryPolicy(ctx: RetryPolicyContext, agentDir = getAgentDi
 
 export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 	pi.registerFlag(STALL_TIMEOUT_FLAG, {
-		description: `Abort and auto-retry stalled provider streams after this many ms; use 0/off/false to disable. Defaults to ${DEFAULT_STALL_TIMEOUT_MS}.`,
+		description: `Warn about silent provider streams after this many ms without cancelling the run; use 0/off/false to disable. Defaults to ${DEFAULT_STALL_TIMEOUT_MS}.`,
 		type: "string",
 	});
 
@@ -83,7 +75,6 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 	let stallTimer: NodeJS.Timeout | undefined;
 	let providerWatchdogActive = false;
 	let runningTools = 0;
-	let waitingForStallAbortMessage = false;
 	let retryPolicyEnabled = true;
 	let hasResolvedRetryPolicy = false;
 	let warnedRetryPolicyDisabled = false;
@@ -156,12 +147,11 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
 		clearStatus(ctx);
 		if (ctx.hasUI && !warnedRetryPolicyDisabled) {
 			warnedRetryPolicyDisabled = true;
 			ctx.ui.notify(
-				'pi-retry requires Pi setting "retry.enabled": true; retry hints and stall recovery are inactive while it is disabled.',
+				'pi-retry requires Pi setting "retry.enabled": true; retry hints and stall warnings are inactive while it is disabled.',
 				"warning",
 			);
 		}
@@ -183,17 +173,26 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 		providerWatchdogActive = true;
 		stallTimer = setTimeout(() => {
 			stallTimer = undefined;
-			providerWatchdogActive = false;
-			if (ctx.isIdle()) return;
+			if (ctx.isIdle()) {
+				providerWatchdogActive = false;
+				return;
+			}
 
-			waitingForStallAbortMessage = true;
-			if (ctx.hasUI) showRetryStatus(ctx);
-			ctx.abort();
+			// ctx.abort() cancels the entire run, including automatic retries.
+			// ponytail: warning-only; request-scoped cancellation if Pi adds a public API.
+			// Leave request cancellation and recovery to Pi's provider timeouts.
+			if (ctx.hasUI) {
+				setTransientStatus(ctx, "stalled", "stalled", STATUS_VISIBLE_MS);
+				ctx.ui.notify(
+					`No provider stream events for ${timeoutMs / 1000}s; waiting for Pi's provider timeout and automatic retry.`,
+					"warning",
+				);
+			}
 		}, timeoutMs);
 	};
 
 	const observeProviderOrStreamEvent = (ctx: WatchdogContext) => {
-		if (!providerWatchdogActive || waitingForStallAbortMessage) return;
+		if (!providerWatchdogActive) return;
 		if (ctx.isIdle()) {
 			disarmStallWatchdog();
 			providerWatchdogActive = false;
@@ -208,7 +207,6 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 		runningTools = 0;
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
 		clearStatus(ctx);
 		refreshRetryPolicy(ctx);
 	});
@@ -216,7 +214,6 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
 		clearStatus(ctx);
 	});
 
@@ -231,13 +228,16 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 	pi.on("before_provider_request", (_event, ctx) => {
 		refreshRetryPolicy(ctx);
 		if (ctx.hasUI) clearIncomingStatus(ctx);
-		// Requests fired while a tool runs (e.g. pi's cache-warming replay) emit no
-		// stream events, so arming would abort the tool after the timeout.
+		// Cache-warming requests during tool execution must not start a provider watchdog.
 		if (runningTools > 0) return;
 		armStallWatchdog(ctx);
 	});
 
 	pi.on("after_provider_response", (_event, ctx) => {
+		observeProviderOrStreamEvent(ctx);
+	});
+
+	pi.on("provider_stream_event", (_event, ctx) => {
 		observeProviderOrStreamEvent(ctx);
 	});
 
@@ -252,37 +252,16 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 	pi.on("agent_end", (_event, ctx) => {
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
-		waitingForStallAbortMessage = false;
 		if (ctx.hasUI) clearIncomingStatus(ctx);
 	});
 
 	pi.on("message_end", (event, ctx) => {
-		const message = event.message as unknown as MessageShape;
+		const message = event.message;
 
 		if (message.role !== "assistant") return;
 		disarmStallWatchdog();
 		providerWatchdogActive = false;
 		if (ctx.hasUI) clearIncomingStatus(ctx);
-
-		if (waitingForStallAbortMessage) {
-			waitingForStallAbortMessage = false;
-			const originalErrorMessage =
-				typeof message.errorMessage === "string"
-					? message.errorMessage
-					: "Provider stream stalled while Pi was waiting for a response.";
-
-			if (!originalErrorMessage.includes(STALL_WATCHDOG_TAG)) {
-				const errorMessage = `${originalErrorMessage}\n\n${STALL_WATCHDOG_TAG} ${RETRYABLE_HINT}; treating stalled provider stream as retryable.`;
-
-				return {
-					message: {
-						...message,
-						stopReason: "error",
-						errorMessage,
-					} as typeof event.message,
-				};
-			}
-		}
 
 		if (message.stopReason !== "error") return;
 		if (typeof message.errorMessage !== "string") return;
@@ -331,7 +310,7 @@ export default function retry(pi: ExtensionAPI, options: RetryOptions = {}) {
 			message: {
 				...message,
 				errorMessage,
-			} as typeof event.message,
+			},
 		};
 	});
 }
